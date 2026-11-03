@@ -5,7 +5,12 @@ import {
   randomBytes,
   timingSafeEqual,
 } from "crypto";
-import { getEncryptionKeyHex, requireEnv } from "@/lib/env";
+import {
+  getEncryptionKeyHex,
+  getMetaGraphApiVersion,
+  requireEnv,
+} from "@/lib/env";
+import { isFacebookLoginMode } from "@/lib/meta/login-mode";
 
 // Instagram API with Instagram Login authorizes on www.instagram.com. The old
 // api.instagram.com/oauth/authorize host belonged to the retired Basic Display
@@ -87,7 +92,151 @@ export function verifyOAuthState(state: string | null): OAuthStatePayload | null
   }
 }
 
+// Facebook Login (Unified login) scopes for the Instagram API. Used only when
+// no Facebook Login for Business configuration ID is set; a configuration
+// carries its own permission list.
+const FACEBOOK_LOGIN_SCOPES = [
+  "instagram_basic",
+  "instagram_manage_comments",
+  "instagram_manage_messages",
+  "instagram_manage_insights",
+  "pages_show_list",
+  "pages_read_engagement",
+  "pages_manage_metadata",
+  "business_management",
+].join(",");
+
+function facebookGraphBase(): string {
+  return `https://graph.facebook.com/${getMetaGraphApiVersion()}`;
+}
+
+function getFacebookAuthorizationUrl(redirectUri: string, state: string): string {
+  const params = new URLSearchParams({
+    client_id: requireEnv("INSTAGRAM_APP_ID"),
+    redirect_uri: redirectUri,
+    response_type: "code",
+    state,
+  });
+  const configId = process.env.FACEBOOK_LOGIN_CONFIG_ID?.trim();
+  if (configId) {
+    params.set("config_id", configId);
+    params.set("override_default_response_type", "true");
+  } else {
+    params.set("scope", FACEBOOK_LOGIN_SCOPES);
+  }
+  return `https://www.facebook.com/${getMetaGraphApiVersion()}/dialog/oauth?${params.toString()}`;
+}
+
+async function readGraphJson<T>(response: Response, step: string): Promise<T> {
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data?.error) {
+    const message = data?.error?.message ?? JSON.stringify(data);
+    throw new Error(`${step} failed: ${message}`);
+  }
+  return data as T;
+}
+
+interface FacebookPage {
+  id: string;
+  name?: string;
+  access_token?: string;
+  instagram_business_account?: { id: string; username?: string };
+}
+
+/**
+ * Pick the Page whose linked Instagram account should be connected. With
+ * META_INSTAGRAM_USERNAME set, only that account is accepted, so a person who
+ * manages several Pages cannot connect the wrong one by accident.
+ */
+export function selectInstagramPage(
+  pages: FacebookPage[],
+  wantedUsername?: string
+): FacebookPage & { access_token: string; instagram_business_account: { id: string } } {
+  const candidates = pages.filter(
+    (page) => page.access_token && page.instagram_business_account?.id
+  ) as Array<
+    FacebookPage & { access_token: string; instagram_business_account: { id: string; username?: string } }
+  >;
+  const wanted = wantedUsername?.trim().replace(/^@/, "").toLowerCase();
+  if (wanted) {
+    const match = candidates.find(
+      (page) => page.instagram_business_account.username?.toLowerCase() === wanted
+    );
+    if (!match) {
+      throw new Error(
+        `No Facebook Page you granted is linked to the Instagram account @${wanted}`
+      );
+    }
+    return match;
+  }
+  if (candidates.length === 0) {
+    throw new Error(
+      "None of the Facebook Pages you granted has a linked Instagram professional account"
+    );
+  }
+  return candidates[0];
+}
+
+async function exchangeFacebookCode(
+  code: string,
+  redirectUri: string
+): Promise<{ accessToken: string; userId: string }> {
+  const clientId = requireEnv("INSTAGRAM_APP_ID");
+  const clientSecret = requireEnv("INSTAGRAM_APP_SECRET");
+
+  const codeUrl = new URL(`${facebookGraphBase()}/oauth/access_token`);
+  codeUrl.searchParams.set("client_id", clientId);
+  codeUrl.searchParams.set("client_secret", clientSecret);
+  codeUrl.searchParams.set("redirect_uri", redirectUri);
+  codeUrl.searchParams.set("code", code);
+  const short = await readGraphJson<{ access_token: string }>(
+    await fetch(codeUrl.toString()),
+    "Token exchange"
+  );
+
+  // A Page token derived from a long-lived user token never expires. System
+  // user tokens from a Business login configuration are already long-lived and
+  // may refuse this exchange, so fall back to the token we have.
+  let userToken = short.access_token;
+  try {
+    const longUrl = new URL(`${facebookGraphBase()}/oauth/access_token`);
+    longUrl.searchParams.set("grant_type", "fb_exchange_token");
+    longUrl.searchParams.set("client_id", clientId);
+    longUrl.searchParams.set("client_secret", clientSecret);
+    longUrl.searchParams.set("fb_exchange_token", short.access_token);
+    const long = await readGraphJson<{ access_token: string }>(
+      await fetch(longUrl.toString()),
+      "Long-lived token exchange"
+    );
+    userToken = long.access_token;
+  } catch (error) {
+    console.warn("[OAuth] Long-lived exchange skipped:", error);
+  }
+
+  const pagesUrl = new URL(`${facebookGraphBase()}/me/accounts`);
+  pagesUrl.searchParams.set(
+    "fields",
+    "id,name,access_token,instagram_business_account{id,username}"
+  );
+  pagesUrl.searchParams.set("limit", "100");
+  pagesUrl.searchParams.set("access_token", userToken);
+  const pages = await readGraphJson<{ data?: FacebookPage[] }>(
+    await fetch(pagesUrl.toString()),
+    "Listing Facebook Pages"
+  );
+
+  const page = selectInstagramPage(
+    pages.data ?? [],
+    process.env.META_INSTAGRAM_USERNAME
+  );
+  return {
+    accessToken: page.access_token,
+    userId: page.instagram_business_account.id,
+  };
+}
+
 export function getAuthorizationUrl(redirectUri: string, state: string): string {
+  if (isFacebookLoginMode()) return getFacebookAuthorizationUrl(redirectUri, state);
   const params = new URLSearchParams({
     client_id: requireEnv("INSTAGRAM_APP_ID"),
     redirect_uri: redirectUri,
@@ -104,6 +253,7 @@ export async function exchangeCodeForToken(
   code: string,
   redirectUri: string
 ): Promise<{ accessToken: string; userId: string }> {
+  if (isFacebookLoginMode()) return exchangeFacebookCode(code, redirectUri);
   const body = new URLSearchParams({
     client_id: requireEnv("INSTAGRAM_APP_ID"),
     client_secret: requireEnv("INSTAGRAM_APP_SECRET"),

@@ -67,7 +67,10 @@ export async function GET(request: NextRequest) {
     }
 
     const encryptedToken = encryptToken(longLivedToken);
-    const tokenExpiresAt = new Date(Date.now() + expiresIn * 1000);
+    // expiresIn 0 = a token that does not expire (Facebook Login Page token),
+    // which the refresh cron must leave alone.
+    const tokenExpiresAt =
+      expiresIn > 0 ? new Date(Date.now() + expiresIn * 1000) : null;
 
     let webhookSubscribed = false;
     try {
