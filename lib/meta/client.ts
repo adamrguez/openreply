@@ -933,13 +933,10 @@ export async function subscribeInstagramAccountToWebhooks(
   instagramAccountId: string,
   accessToken: string
 ): Promise<{ success: boolean }> {
-  // Facebook Login: Instagram events reach the app through the linked Page,
-  // so the Page itself must be subscribed to the app.
-  const facebook = isFacebookLoginMode();
+  if (isFacebookLoginMode()) return subscribePageToApp(accessToken);
+
   const response = await fetch(
-    facebook
-      ? `${facebookGraphBase()}/me/subscribed_apps`
-      : `${instagramGraphBase()}/${instagramAccountId}/subscribed_apps`,
+    `${instagramGraphBase()}/${instagramAccountId}/subscribed_apps`,
     {
       method: "POST",
       headers: {
@@ -947,14 +944,44 @@ export async function subscribeInstagramAccountToWebhooks(
         Authorization: `Bearer ${accessToken}`,
       },
       body: JSON.stringify({
-        subscribed_fields: facebook
-          ? ["feed", "messages", "messaging_postbacks"]
-          : ["comments", "messages"],
+        subscribed_fields: ["comments", "messages"],
       }),
     }
   );
 
   return handleResponse(response);
+}
+
+/**
+ * Facebook Login: Instagram events reach the app only once the linked Page has
+ * the app installed (POST /{page}/subscribed_apps). Which fields the Page is
+ * subscribed to does not filter Instagram events, but Meta requires at least
+ * one and checks a permission per field: messaging fields need
+ * pages_messaging, `feed` needs pages_manage_metadata. Try the full set first
+ * and fall back to `feed` alone, which is all Instagram comments and DMs need.
+ */
+async function subscribePageToApp(
+  pageAccessToken: string
+): Promise<{ success: boolean }> {
+  const attempts = [["feed", "messages", "messaging_postbacks"], ["feed"]];
+  let lastError: unknown;
+  for (const fields of attempts) {
+    try {
+      const response = await fetch(`${facebookGraphBase()}/me/subscribed_apps`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${pageAccessToken}`,
+        },
+        body: JSON.stringify({ subscribed_fields: fields }),
+      });
+      return await handleResponse<{ success: boolean }>(response);
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof PermissionError)) throw error;
+    }
+  }
+  throw lastError;
 }
 
 export async function debugToken(inputToken: string, accessToken: string) {

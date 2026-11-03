@@ -157,4 +157,30 @@ describe("Facebook Login mode", () => {
       "https://graph.facebook.com/v25.0/me/subscribed_apps"
     );
   });
+
+  it("falls back to the feed field when messaging permissions are missing", async () => {
+    const bodies: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body));
+        bodies.push(body);
+        if (body.subscribed_fields.length > 1) {
+          return json(
+            { error: { message: "needs pages_messaging", type: "OAuthException", code: 200 } },
+            403
+          );
+        }
+        return json({ success: true });
+      })
+    );
+
+    await expect(
+      subscribeInstagramAccountToWebhooks("1784", "page-token")
+    ).resolves.toEqual({ success: true });
+    expect(bodies).toEqual([
+      { subscribed_fields: ["feed", "messages", "messaging_postbacks"] },
+      { subscribed_fields: ["feed"] },
+    ]);
+  });
 });
